@@ -184,7 +184,7 @@ def retrieval(itr):
                 json.dump(data, file)
 
 def sample_get(idx):
-    path= '/nfs/roberts/pi/pi_kmh66/trs58/Wavelet_data/Trap_CCA_long_trap_44_UNetScattering_1/results/'
+    path= '/nfs/roberts/pi/pi_kmh66/spreadsheetData/SpreadsheetRow62_waveletData/Trap_CCA_long_trap_44_UNetScattering_1/results/'
     files = [i for i in os.scandir(path)]
     length = len(files)
     
@@ -197,10 +197,15 @@ def sample_get(idx):
         if file.name.endswith('.egg'):
             eggfilepath = filepath+"/"+file.name
 
+        if file.name.endswith('.root') and file.name.startswith('KassCavitySeed'):
+                bpath = filepath+"/"+file.name
+
     jsonfilepath = filepath+'/LocustEventProperties.json'
 
     with open(jsonfilepath, 'r') as file:
         data = json.load(file)
+
+    fs = float(data['run-parameters']['sampling-freq-mega-hz'])*1e6
 
     file = EggFileReader(eggfilepath)
     stream = file.load_ts_stream()[0][0][0]
@@ -209,6 +214,10 @@ def sample_get(idx):
     with open(f"data/metadata_{idx}.json", 'w') as file:
         json.dump(data, file)
 
+    b_avg, n_total, t_start_total, t_end_total = time_weighted_average(bpath, t_min=0, t_max=1/fs)
+
+    print(b_avg)
+
 def get_quantities(path):
     with open(path) as file:
         metadata = json.load(file)
@@ -216,13 +225,15 @@ def get_quantities(path):
     fs = metadata['run-parameters']['sampling-freq-mega-hz']
     n = metadata['0']['ntracks']
     f = metadata['0']['0']['output-avg-frequency']
+    finit = metadata['0']['0']['output-inst-start-frequency']
+    slope = metadata['0']['0']['slope']
     times = np.zeros((2, n))
 
     for i in range(n):
         times[0, i] = metadata['0'][f"{i}"]['start-time']
         times[1, i] = metadata['0'][f"{i}"]['end-time']
 
-    return fs, times, f
+    return fs, times, f, finit, slope
         
 
 def visual(Wx, wavelet, w=10, units=1e6, fs=403e6, numticks=12, save=False):

@@ -185,7 +185,22 @@ def energy_SI(f, B):
     c = 299792458
     return (e*B/(2*np.pi * f) - m_e)*c**2 * 6.241509e18 # J -> eV conversion
 
-def energy_on_many(itr, path, ft=31e6, units=1e6, magnitude=False, rel=False, B=20, C=3, num_batches=5, LOFREQ=25970200000.0):
+def energy(f, B):
+    const = 1.60217733e-19/9.1093837139e-31
+    m_e = 511e3
+
+    return m_e*(const*B/(2*np.pi * f) - 1)
+
+def noise_model(len_array, constant=1, rng=None): # src/utils/noise.py
+    sampling_freq = 403E6
+    mu = 0
+    R = 50  # ohms
+    sigma = np.sqrt(R * 0.5) * np.sqrt(2.2e-13 * constant*sampling_freq)
+    if rng is None:
+        return np.random.normal(mu, sigma, len_array)
+    return rng.normal(mu, sigma, len_array)
+
+def energy_on_idx(idx, path, ft=31e6, units=1e6, magnitude=False, rel=False, B=20, C=3, num_batches=5, LOFREQ=25970200000.0):
     files = [i for i in os.scandir(path)]
     length = len(files)
     if itr >= length:
@@ -373,10 +388,306 @@ def energy_on_many(itr, path, ft=31e6, units=1e6, magnitude=False, rel=False, B=
 
         ### ENERGY
 
-        
         b_avg, n_total, t_start_total, t_end_total = time_weighted_average(bpath, t_min=0, t_max=1/fs)
-        CWT_energy = energy_SI(init_f_CWT*1e6 + fmix + LOFREQ, b_avg)
-        STFT_energy = energy_SI(init_f_STFT*1e6 + fmix + LOFREQ, b_avg)
+        CWT_energy = energy(init_f_CWT*1e6 + fmix + LOFREQ - fs/2, b_avg)
+        STFT_energy = energy(init_f_STFT*1e6 + fmix + LOFREQ - fs/2, b_avg)
+    
+
+def energy_on_many(itr, path, ft=31e6, units=1e6, magnitude=False, rel=False, B=20, C=3, num_batches=5, LOFREQ=25970200000.0):
+    files = [i for i in os.scandir(path)]
+    length = len(files)
+    if itr >= length:
+        itr = length-1
+    i = 0
+    error = np.zeros((2, itr))
+    error_fft = np.zeros((2, itr))
+    error_energy = np.zeros((2, itr))
+    FWHMs = np.zeros((2, itr))
+    SNRs = np.zeros((2, itr))
+
+    while i < itr:
+        filepath = path
+        
+        i += 1
+    
+        name = files[i].name
+        if not name[0].isdigit():
+            continue
+        
+        filepath = filepath+name
+
+        subfiles = os.scandir(filepath)
+
+        for file in subfiles:
+            if file.name.endswith('.egg'):
+                eggfilepath = filepath+"/"+file.name
+
+            if file.name.endswith('.root') and file.name.startswith('KassCavitySeed'):
+                bpath = filepath+"/"+file.name
+
+        jsonfilepath = filepath+'/LocustEventProperties.json'
+
+        with open(jsonfilepath, 'r') as file:
+            metadata = json.load(file)
+
+        file = EggFileReader(eggfilepath)
+        stream = file.load_ts_stream()[0][0][0]
+        I_data = stream.real
+        Q_data = stream.imag
+
+        if metadata['0']['0']['pitch-angle'] <= 0:
+            continue
+
+    
+        if (i-1) % 10 == 0: print(f"{i}/{itr}")
+        fs = float(metadata['run-parameters']['sampling-freq-mega-hz'])*units
+        f = metadata['0']['0']['output-avg-frequency']
+        fmix = f - ft
+        start = metadata['0']['0']['start-time']
+        end = metadata['0']['0']['end-time']
+
+        f_init = metadata['0']['0']['output-track-start-frequency'] # switch track to inst
+
+        slope = metadata['0']['0']['slope']
+
+        ENERGY = metadata['0']['0']['energy-ev']
+        
+        actual = ft/1e6
+    
+        idx = int(fs*start)
+        edx = int(fs*end)
+
+        rng = np.linspace(idx, edx, num_batches, endpoint=True)
+        rng = [int(j) for j in rng]
+
+        fcs = []
+        fwhmcs = []
+        snrcs = []
+
+        ### STFT
+
+        data = (I_data[idx:edx]+noise_model(len(range(idx, edx)))) + 1j*(Q_data[idx:edx]+noise_model(len(range(idx, edx))))
+        T  = float(data.size)/fs
+        N  = len(data)
+        t  = np.arange(N) / fs
+        signal_locust = data * (-1.0)**np.arange(N)
+        signal = signal_locust * np.exp(-1j * 2*np.pi * fmix * t)
+
+        """
+        t_center = (end-start)/2     # seconds -- time where there is a track
+        window   = 5e-3       # 5 ms around it
+        i0 = max(0, int((t_center - window/2) * fs))
+        i1 = min(N, int((t_center + window/2) * fs))
+        signal = signal[i0:i1]
+        signal_locust = signal_locust[i0:i1]
+        """
+        N = len(signal)
+        t = np.arange(N) / fs
+        
+        win_len = min(1024, N // 8)     
+        hop     = max(1, win_len // 8)
+        
+        win = boxcar(win_len, sym=True)
+        SFT = ShortTimeFFT(win, hop=hop, fs=fs, fft_mode='centered',
+                           scale_to='magnitude')
+        Sxx = SFT.stft(signal)
+        f_stft = SFT.f
+        t_stft = SFT.t(N)
+
+        #### FWHM STFT
+        new_Sxx = Sxx
+
+        freq_change = slope*(t_stft[1]-t_stft[0])
+        freq_res = f_stft[1]-f_stft[0]
+
+        running_freq = 0
+        
+        for j in range(len(t_stft)):
+            if running_freq > freq_res:
+                new_Sxx[:-1, j:] = new_Sxx[1:, j:]
+                new_Sxx[-1, j:] = new_Sxx[0, j:]
+
+            running_freq = running_freq % freq_res + freq_change
+
+        m_STFT = np.sum(np.abs(new_Sxx), axis=1)
+        a_f = f_stft[1]-f_stft[0]
+        n = m_STFT
+        peaks = find_peaks(n)[0]
+        #peaks = peaks[np.where(n[peaks] >= 100)[0]]
+        widths = np.array(peak_widths(n, peaks, rel_height=0.5))
+
+        fullxrange = np.array(range(len(f_stft)))
+        a_f = f_stft[1]-f_stft[0]
+        f_bounds = map_index_to_x(f_stft[fullxrange], a_f, widths[2:])
+        f_widths = np.zeros((len(f_bounds[:, 0]), 4))
+        f_widths[:, 0] = f_bounds[:, 1] - f_bounds[:, 0]
+
+        peak_width = max(f_widths[:, 0])
+        
+        FWHMs[1,i-1] = peak_width        
+
+        means_STFT = np.mean(np.abs(Sxx), axis=1)
+        inits_STFT = Sxx[:, 0]
+        
+        freq_cands = np.where(np.abs(f_stft - ft) <= peak_width/2)[0]
+
+        ### STFT SNR
+        Ps_STFT = np.mean(np.abs(new_Sxx[freq_cands]))
+        noise_cands = np.where(np.abs(f_stft - ft) > peak_width)[0]
+        Pn_STFT = np.mean(np.abs(new_Sxx[noise_cands]))
+
+        SNRs[1, i-1] = Ps_STFT/Pn_STFT
+        
+        
+        ### STFT RECON
+        f_STFT = 0
+        
+        if freq_cands.size > 0:
+            cands = means_STFT[freq_cands]
+            f_STFT = f_stft[freq_cands[np.argmax(cands)]]/1e6
+            
+            init_cands = inits_STFT[freq_cands]
+            init_f_STFT = f_stft[freq_cands[np.argmax(cands)]]/1e6
+        else:
+            f_STFT = f_stft[np.argmax(means_STFT)]/1e6
+
+            init_f_STFT = f_stft[np.argmax(inits_STFT)]/1e6
+
+
+        ### CWT
+        init_f_CWT = 0
+        running_freq = 0
+        for j in range(len(rng)-1):
+            data = (I_data[rng[j]:rng[j+1]]+noise_model(len(range(rng[j], rng[j+1])))) + 1j*(Q_data[rng[j]:rng[j+1]]+noise_model(len(range(rng[j], rng[j+1]))))
+            T  = float(data.size)/fs
+            N  = len(data)
+            t  = np.arange(N) / fs
+            signal_locust = data * (-1.0)**np.arange(N)
+    
+            signal = signal_locust * np.exp(-1j * 2*np.pi * fmix * t)
+    
+            """
+            t_center = (end-start)/2     # seconds -- time where there is a track
+            window   = 5e-3       # 5 ms around it
+            i0 = max(0, int((t_center - window/2) * fs))
+            i1 = min(N, int((t_center + window/2) * fs))
+            signal = signal[i0:i1]
+            signal_locust = signal_locust[i0:i1]
+            """
+            N = len(signal)
+            t = np.arange(N) / fs
+        
+            
+            wavelet = f'cmor{B}-{C}'
+            
+            fmin     = 20e6
+            fmax     = 50e6
+            n_voices = 96
+             
+            freqs_pos = np.logspace(np.log10(fmin), np.log10(fmax), n_voices)
+            scales    = pywt.frequency2scale(wavelet, freqs_pos / fs)
+    
+            coefs, f_returned = pywt.cwt(
+                signal, scales, wavelet, sampling_period=1/fs, method='fft'
+            )
+            mag = np.abs(coefs)
+
+            ### CWT FWHMS
+
+            t_plot = np.arange(mag.shape[1]) / fs
+
+                    
+            freq_change = slope*(t_plot[1]-t_plot[0])
+            
+            freq_ress = np.diff(freqs_pos)
+                    
+            idx = np.argmin(np.abs(freqs_pos - ft))
+                    
+            new_mag = mag.copy()
+            for k in range(len(t_plot)):
+                if running_freq > freq_ress[idx]:
+                    new_mag[:-1, k:] = new_mag[1:, k:]
+                    new_mag[-1, k:] = new_mag[0, k:]
+                    idx += 1
+                    running_freq = running_freq % freq_ress[idx-1] + freq_change
+                else:
+                    running_freq = running_freq % freq_ress[idx] + freq_change
+    
+            m_CWT = np.sum(new_mag, axis=1)
+            fullxrange = np.array(range(len(m_CWT)))        
+            a_f = freqs_pos[1]-freqs_pos[0]
+            n = m_CWT
+            peaks = find_peaks(n)[0]
+            #peaks = peaks[np.where(n[peaks] >= 50)[0]]
+            widths = np.array(peak_widths(n, peaks, rel_height=0.5))
+            
+            f_bounds = map_index_to_x(freqs_pos[fullxrange], a_f, widths[2:])
+            f_widths = np.zeros((len(f_bounds[:, 0]), 4))
+            f_widths[:, 0] = f_bounds[:, 1] - f_bounds[:, 0]
+
+            peak_width = max(f_widths[:, 0])
+    
+            fwhmcs.append(peak_width)
+    
+            means_CWT = np.mean(mag, axis=1)                
+    
+            freq_cands = np.where(np.abs(freqs_pos - ft) <= peak_width/2)[0]
+
+            ### CWT SNR
+            Ps_CWT = np.mean(np.abs(new_mag[freq_cands]))
+            noise_cands = np.where(np.abs(freqs_pos - ft) > peak_width)[0]
+            Pn_CWT = np.mean(np.abs(new_mag[noise_cands]))
+            
+            snrcs.append(Ps_CWT/Pn_CWT)
+
+            ### CWT RECON
+                    
+            if freq_cands.size > 0:
+                cands = means_CWT[freq_cands]
+                f_CWT = freqs_pos[freq_cands[np.argmax(cands)]]/1e6
+                fcs.append(f_CWT)
+
+                if j == 0:
+                    inits_CWT = mag[:, 0]
+                    init_cands = inits_CWT[freq_cands]
+                    init_f_CWT = freqs_pos[freq_cands[np.argmax(cands)]]/1e6
+            else:
+                f_CWT = freqs_pos[np.argmax(means_CWT)]/1e6
+                fcs.append(f_CWT)
+
+                if j == 0:
+                    inits_CWT = mag[:, 0]
+                    init_f_CWT = freqs_pos[np.argmax(inits_CWT)]/1e6
+
+
+        ### FFT
+        data = I_data[idx:edx] + 1j*Q_data[idx:edx]
+        T  = float(data.size)/fs
+        N  = len(data)
+        t  = np.arange(N) / fs
+        signal_locust = data * (-1.0)**np.arange(N)
+        signal = signal_locust * np.exp(-1j * 2*np.pi * fmix * t)
+        
+        fft_vals = np.fft.fft(signal)
+        fft_freqs = np.fft.fftfreq(N, d=1/fs)
+
+        
+        freq_cands = np.where(np.abs(fft_freqs - ft) <= 5e6)[0]
+        f_FFT = 0
+        
+        if freq_cands.size > 0:
+            cands = fft_vals[freq_cands]
+            f_FFT = fft_freqs[freq_cands[np.argmax(cands)]]/1e6
+        else:
+            f_FFT = fft_freqs[np.argmax(fft_vals)]/1e6
+
+        ### ENERGY
+
+        b_avg, n_total, t_start_total, t_end_total = time_weighted_average(bpath, t_min=0, t_max=1/fs)
+        CWT_energy = energy(init_f_CWT*1e6 + fmix + LOFREQ - fs/2, b_avg)
+        STFT_energy = energy(init_f_STFT*1e6 + fmix + LOFREQ - fs/2, b_avg)
+
+        ENERGY = energy(f_init + LOFREQ - fs/2, b_avg) # bandaid
 
 
         if rel: denom=actual
@@ -399,43 +710,24 @@ def energy_on_many(itr, path, ft=31e6, units=1e6, magnitude=False, rel=False, B=
             error_energy[0, i-1] = CWT_energy - ENERGY
             error_energy[1, i-1] = STFT_energy - ENERGY
 
-        ### FWHMs
+        FWHMs[0, i-1] = np.mean(fwhmcs)
+        SNRs[0, i-1] = np.mean(snrcs)
 
-        m_CWT = np.sum(mag, axis=1)
-        fullxrange = np.array(range(len(m_CWT)))        
-        a_f = freqs_pos[1]-freqs_pos[0]
-        n = m_CWT
-        peaks = find_peaks(n)[0]
-        #peaks = peaks[np.where(n[peaks] >= 50)[0]]
-        widths = np.array(peak_widths(n, peaks, rel_height=0.5))
         
-        f_bounds = map_index_to_x(freqs_pos[fullxrange], a_f, widths[2:])
-        f_widths = np.zeros((len(f_bounds[:, 0]), 4))
-        f_widths[:, 0] = f_bounds[:, 1] - f_bounds[:, 0]
 
-        FWHMs[0,i-1]=max(f_widths[:, 0])
-
-        m_STFT = np.sum(np.abs(Sxx), axis=1)
-        a_f = f_stft[1]-f_stft[0]
-        n = m_STFT
-        peaks = find_peaks(n)[0]
-        #peaks = peaks[np.where(n[peaks] >= 100)[0]]
-        widths = np.array(peak_widths(n, peaks, rel_height=0.5))
-
-        fullxrange = np.array(range(len(f_stft)))
-        a_f = f_stft[1]-f_stft[0]
-        f_bounds = map_index_to_x(f_stft[fullxrange], a_f, widths[2:])
-        f_widths = np.zeros((len(f_bounds[:, 0]), 4))
-        f_widths[:, 0] = f_bounds[:, 1] - f_bounds[:, 0]
-        
-        FWHMs[1,i-1]=max(f_widths[:, 0])
+    error = np.trim_zeros(error, "b")
+    error_fft = np.trim_zeros(error_fft, "b")
+    error_energy = np.trim_zeros(error_energy, "b")
+    FWHMs = np.trim_zeros(FWHMs, "b")
+    SNRs = np.trim_zeros(SNRs, "b")
 
 
     print("COMPLETE")    
-    np.save(f"error_{itr}_mag{magnitude}_B{B}_C{C}", error)
-    np.save(f"error_FFT_{itr}_mag{magnitude}_B{B}_C{C}", error_fft)
-    np.save(f"error_ENERGY_{itr}_mag{magnitude}_B{B}_C{C}", error_energy)
-    np.save(f"FWHMs_{itr}_mag{magnitude}_B{B}_C{C}", FWHMs)
+    np.save(f"cuterror_{itr}_mag{magnitude}_B{B}_C{C}", error)
+    np.save(f"cuterror_FFT_{itr}_mag{magnitude}_B{B}_C{C}", error_fft)
+    np.save(f"cuterror_ENERGY_{itr}_mag{magnitude}_B{B}_C{C}", error_energy)
+    np.save(f"cutFWHMs_{itr}_mag{magnitude}_B{B}_C{C}", FWHMs)
+    np.save(F"cutSNRs_{itr}_mag{magnitude}_B{B}_C{C}", SNRs)
 
         
 
@@ -475,7 +767,7 @@ def batch_on_many(itr, ft=31e6, units=1e6, magnitude=False, rel=False, B=20, C=3
         Q_data = stream.imag
 
     
-        if (i-1) % 10 == 0: print(f"{i}/{itr}")
+        if (i-1) % 1 == 0: print(f"{i}/{itr}")
         fs = float(metadata['run-parameters']['sampling-freq-mega-hz'])*units
         f = metadata['0']['0']['output-avg-frequency']
         fmix = f - ft
@@ -658,4 +950,7 @@ batch_on_many(600, B=20, C=3, ft=31e6)
 """
 
 PATH = '/nfs/roberts/pi/pi_kmh66/spreadsheetData/SpreadsheetRow62_waveletData/Trap_CCA_long_trap_44_UNetScattering_1/results/'
-energy_on_many(550, PATH, B=20, C=3, ft=31e6)
+energy_on_many(589, PATH, B=20, C=3, ft=31e6)
+
+PATH = '/nfs/roberts/pi/pi_kmh66/spreadsheetData/SpreadsheetRow57_Trap_waveletSims/Trap_CCA_long_trap_44_UNetScattering_1/results/'
+#energy_on_many(590, PATH, B=20, C=3, ft=31e6)
